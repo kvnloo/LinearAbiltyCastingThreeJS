@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# chiro-verify — doctor + HTML-shell drive for Elemental Sandbox (casting-abilities).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT="$(cd "${SKILL_DIR}/../../.." && pwd)"
+EVIDENCE_DIR="${SKILL_DIR}/evidence"
+NODE_BIN="$(command -v node || true)"
+PKG_BIN="$(command -v npm || true)"
+
+usage() {
+  echo "usage: chiro-verify doctor|shell [--port PORT]" >&2
+  exit 2
+}
+
+verdict() {
+  local name="$1"
+  echo "VERDICT=${name}"
+  case "${name}" in
+    PASS) return 0 ;;
+    FAIL) return 1 ;;
+    INCONCLUSIVE) return 0 ;;
+    *) return 0 ;;
+  esac
+}
+
+need_node() {
+  if [[ -z "${NODE_BIN}" ]]; then
+    echo "node not found on PATH"
+    return 1
+  fi
+  if [[ -z "${PKG_BIN}" ]]; then
+    echo "npm not found on PATH"
+    return 1
+  fi
+  echo "node: $(node -v)"
+  echo "npm: $(npm -v)"
+  return 0
+}
+
+run_build() {
+  cd "${ROOT}"
+  if [[ ! -d node_modules ]]; then
+    echo "npm install (node_modules missing)"
+    npm install
+  fi
+  echo "npm run build"
+  npm run build
+}
+
+cmd="${1:-}"
+shift || true
+PORT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port)
+      PORT="${2:-}"
+      shift 2 || usage
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+
+case "${cmd}" in
+  doctor)
+    echo "ROOT=${ROOT}"
+    if ! need_node; then
+      echo "Doctor cannot run the Vite build without node/npm."
+      verdict INCONCLUSIVE
+      exit 0
+    fi
+    if [[ ! -f "${ROOT}/package.json" || ! -f "${ROOT}/vite.config.js" ]]; then
+      echo "package.json or vite.config.js missing"
+      verdict FAIL
+      exit 1
+    fi
+    if run_build; then
+      echo "npm run build exited 0"
+      verdict PASS
+      exit 0
+    else
+      echo "npm run build failed"
+      verdict FAIL
+      exit 1
+    fi
+    ;;
+  shell)
+    echo "ROOT=${ROOT}"
+    mkdir -p "${EVIDENCE_DIR}"
+    if ! need_node; then
+      echo "shell requires node to start vite preview"
+      verdict INCONCLUSIVE
+      exit 0
+    fi
+    run_build
+    cd "${ROOT}"
+    preview_args=(run preview -- --host 127.0.0.1)
+    if [[ -n "${PORT}" ]]; then
+      preview_args+=(--port "${PORT}")
+    fi
+    log="$(mktemp)"
+    npm "${preview_args[@]}" >"${log}" 2>&1 &
+    PREVIEW_PID=$!
+    echo "PREVIEW_PID=${PREVIEW_PID}"
+    url=""
+    for _ in $(seq 1 60); do
+      if ! kill -0 "${PREVIEW_PID}" 2>/dev/null; then
+        echo "preview exited early"
+        cat "${log}"
+        verdict FAIL
+        exit 1
+      fi
+      url="$(grep -Eo 'https?://(127\.0\.0\.1|localhost):[0-9]+/' "${log}" | head -n 1 || true)"
+      if [[ -n "${url}" ]]; then
+        break
+      fi
+      sleep 0.25
+    done
+    if [[ -z "${url}" ]]; then
+      echo "could not parse preview URL from:"
+      cat "${log}"
+      kill "${PREVIEW_PID}" 2>/dev/null || true
+      verdict FAIL
+      exit 1
+    fi
+    echo "PREVIEW_URL=${url}"
+    body="$(mktemp)"
+    code="$(curl -sS -o "${body}" -w '%{http_code}' "${url}")"
+    echo "HTTP_STATUS=${code}"
+    mkdir -p "${EVIDENCE_DIR}/last-shell"
+    cp "${body}" "${EVIDENCE_DIR}/last-shell/shell.html"
+    cp "${log}" "${EVIDENCE_DIR}/last-shell/shell.log"
+    echo "${code}" > "${EVIDENCE_DIR}/last-shell/http_status.txt"
+    if [[ "${code}" != "200" ]]; then
+      echo "GET / did not return 200"
+      kill "${PREVIEW_PID}" 2>/dev/null || true
+      verdict FAIL
+      exit 1
+    fi
+    missing=0
+    if ! grep -q 'id="viewport"' "${body}"; then
+      echo "missing canvas#viewport (id=\\"viewport\\")"
+      missing=1
+    fi
+    if ! grep -q 'id="loader"' "${body}"; then
+      echo "missing #loader"
+      missing=1
+    fi
+    kill "${PREVIEW_PID}" 2>/dev/null || true
+    wait "${PREVIEW_PID}" 2>/dev/null || true
+    if [[ "${missing}" -ne 0 ]]; then
+      verdict FAIL
+      exit 1
+    fi
+    echo "HTML shell contains #viewport and #loader"
+    echo "WebGL/cast not required for this subcommand; treat casts as INCONCLUSIVE if headless GL is missing."
+    verdict PASS
+    exit 0
+    ;;
+  *)
+    usage
+    ;;
+esac
