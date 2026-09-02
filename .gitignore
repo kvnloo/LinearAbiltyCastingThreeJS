@@ -137,3 +137,7 @@ dist
 
 # Local VFX capture scratch (dev tooling)
 .captures/
+
+# Verification skill proof artifacts (keep the directory)
+.cursor/skills/verify-linear-ability-casting/evidence/*
+!.cursor/skills/verify-linear-ability-casting/evidence/.gitkeep
